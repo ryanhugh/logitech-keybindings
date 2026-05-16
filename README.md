@@ -1,10 +1,12 @@
-# Logitech G915 X Key Remap
+# Logitech Keyboard Key Remap
 
-Menu bar app that watches for a Logitech G915 X keyboard and automatically remaps modifier keys:
+Menu bar app that watches for supported Logitech keyboards and automatically remaps modifier keys:
 
 - Left Option -> Left Command
 - Left Command -> Left Option
 - Right Option -> Left Command
+
+Supported devices are listed in `SUPPORTED_DEVICES` in `remap.py` — currently the G915 X (PID 45962) and keyboards on the Logitech Lightspeed receiver (PID 50503). Add more `(product_id, name)` entries there to extend support.
 
 ## Status
 
