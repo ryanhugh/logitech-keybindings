@@ -11,8 +11,9 @@ VENDOR_ID = 1133
 
 # (product_id, friendly_name) for every supported Logitech keyboard.
 SUPPORTED_DEVICES: list[tuple[int, str]] = [
-    (45962, "G915 X"),       # 0xB38A — G915 X over Bluetooth
-    (50503, "G-Lightspeed"), # 0xC547 — Lightspeed USB receiver (G915/TKL/Pro)
+    (45962, "G915 X"),         # 0xB38A — G915 X over Bluetooth
+    (50503, "G-Lightspeed"),   # 0xC547 — Lightspeed USB receiver (G915/TKL/Pro)
+    (50007, "G915 X LS TKL"),  # 0xC357 — G915 X TKL wired over USB
 ]
 
 HIDUTIL_SET_JSON = r'''{
