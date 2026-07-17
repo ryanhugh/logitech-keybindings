@@ -1,1 +1,4 @@
 .DS_Store
+
+# Compiled Swift binary (build artifact)
+logitech-remap
