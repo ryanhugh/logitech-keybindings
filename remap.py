@@ -5,7 +5,11 @@ import threading
 import time
 from typing import Optional
 
+import AppKit
 import rumps
+
+# NSApplicationActivationPolicyAccessory — menu-bar only, hidden from Dock and Cmd-Tab.
+NS_ACTIVATION_POLICY_ACCESSORY = 1
 
 VENDOR_ID = 1133
 
@@ -67,6 +71,7 @@ class RemapApp(rumps.App):
         self.menu = [self.status_item]
         self._prev_pids: set[int] = set()
         self._mapped_pids: set[int] = set()
+        self._policy_set = False
 
     def update_status(self, present: list[tuple[int, str]], mapped_pids: set[int]):
         if not present:
@@ -84,6 +89,10 @@ class RemapApp(rumps.App):
 
     @rumps.timer(1)
     def poll(self, _):
+        if not self._policy_set:
+            AppKit.NSApp.setActivationPolicy_(NS_ACTIVATION_POLICY_ACCESSORY)
+            self._policy_set = True
+
         rc, out, err = run(IOREG_CMD)
         if rc != 0:
             return
