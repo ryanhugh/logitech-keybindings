@@ -58,8 +58,14 @@ private let PERSISTENCE_VOLATILE: UInt8 = 0x00
 /// Zones are written blind rather than read back first — four covers this
 /// hardware, and a zone the keyboard doesn't have simply errors.
 private let ZONE_COUNT: UInt8 = 4
-/// Highest key id swept by the 0x8081 fallback, matching `lights.py`.
+/// Highest key id swept by the 0x8081 path, matching `lights.py`.
 private let MAX_KEY_ID: UInt8 = 0xFF
+
+/// Gap between per-key frames. The controller drops closely-spaced reports —
+/// `lights.py` never hit this because it waited for a reply to every call, which
+/// paced it accidentally. Sixty-odd frames at this gap still finish in well
+/// under a second.
+private let FRAME_GAP_MICROSECONDS: UInt32 = 8_000
 
 /// The HID++ long-report collections, by (usage page, usage). Which one a
 /// keyboard exposes depends on how it is attached: Bluetooth LE devices use a
@@ -100,10 +106,18 @@ final class KeyboardLight {
     /// Same one-shot treatment for "the keyboard isn't there", which is the
     /// normal state whenever it is asleep or unpaired.
     private var reportedNoDevice = false
+    /// The frame commit going unanswered is not fatal — the stream above it is
+    /// what paints — so it is worth one line, not one per repaint.
+    private var reportedCommitTimeout = false
     /// Whether the last repaint landed. Only transitions are logged — a line
     /// every ten seconds forever would bury everything else in the log.
     private var lastRepaintOK: Bool?
     private var inputBuffer = [UInt8](repeating: 0, count: 64)
+    /// Diagnostics for the one failure that cannot be read off a log line:
+    /// the keyboard opened, but the HID++ conversation went nowhere.
+    private var lastSendResult: IOReturn = kIOReturnSuccess
+    private var reportsSeen = 0
+    private var lastFrame = "none" 
 
     private init() {}
 
@@ -180,7 +194,9 @@ final class KeyboardLight {
             candidate, CFRunLoopGetCurrent(), CFRunLoopMode.defaultMode.rawValue)
 
         guard resolveDeviceIndex(), let path = resolvePathDescribing() else {
-            log("keyboard opened but exposes no lighting feature")
+            log("keyboard opened but exposes no lighting feature "
+                + "(setReport=\(String(format: "0x%08x", lastSendResult)), "
+                + "replies seen=\(reportsSeen), last=\(lastFrame))")
             closeDevice()
             return false
         }
@@ -378,13 +394,17 @@ final class KeyboardLight {
                 params[slot * 4 + 3] = LIGHT_COLOR.b
             }
             guard send(featureIndex: index, function: 1, params: params) else { return false }
+            usleep(FRAME_GAP_MICROSECONDS)
             if keyID > MAX_KEY_ID - 4 { break }
             keyID += 4
         }
-        // frameEnd commits what was streamed; this one is worth a reply, since
-        // it is the call that tells us the whole frame landed.
-        return call(featureIndex: index, function: 7,
-                    params: [UInt8](repeating: 0, count: 16)) != nil
+        // frameEnd commits what was streamed. A lost reply is not a lost frame,
+        // so it does not fail the repaint — only the writes above can do that.
+        if call(featureIndex: index, function: 7,
+                params: [UInt8](repeating: 0, count: 16)) == nil {
+            logOnce(&reportedCommitTimeout, "frame commit went unanswered — the colour may still have landed")
+        }
+        return true
     }
 
     // MARK: - HID++ transport
@@ -429,11 +449,15 @@ final class KeyboardLight {
                 device, kIOHIDReportTypeOutput, CFIndex(HIDPP_LONG_REPORT_ID),
                 buffer.baseAddress!, buffer.count)
         }
+        lastSendResult = result
         return result == kIOReturnSuccess
     }
 
     /// Called from the input-report callback, on this same thread.
     fileprivate func receive(reportID: UInt32, bytes: [UInt8]) {
+        reportsSeen += 1
+        lastFrame = "id=\(reportID) " + bytes.prefix(8).map { String(format: "%02x", $0) }
+            .joined(separator: " ")
         // macOS includes the report id for numbered reports; tolerate either.
         var frame = bytes
         if let first = frame.first, first == UInt8(truncatingIfNeeded: reportID) {
@@ -443,8 +467,12 @@ final class KeyboardLight {
         guard frame.count >= 3, frame[0] == deviceIndex else { return }
         let isError = frame[1] == ERROR_FEATURE_INDEX
         guard isError || frame[1] == waitingOnFeature, frame[2] & 0x0F == SW_ID else { return }
-        // Re-prefix so callers index the same fields the request used.
-        pendingReply = [UInt8(truncatingIfNeeded: reportID)] + frame
+        // Kept report-id-free: [deviceIndex, featureIndex, function|swId,
+        // params…]. Requests carry the report id in byte 0 and replies do not,
+        // so the two layouts are off by one — prefixing this to match the
+        // request put the device index where the error marker is read, and
+        // every good reply scored as an error.
+        pendingReply = frame
     }
 }
 
