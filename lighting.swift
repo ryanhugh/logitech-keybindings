@@ -97,6 +97,9 @@ final class KeyboardLight {
     /// Set once so a missing Input Monitoring grant is reported one time, not
     /// every ten seconds forever.
     private var reportedAccessFailure = false
+    /// Same one-shot treatment for "the keyboard isn't there", which is the
+    /// normal state whenever it is asleep or unpaired.
+    private var reportedNoDevice = false
     /// Whether the last repaint landed. Only transitions are logged — a line
     /// every ten seconds forever would bury everything else in the log.
     private var lastRepaintOK: Bool?
@@ -150,9 +153,15 @@ final class KeyboardLight {
 
     private func ensureOpen() -> Bool {
         if device != nil { return true }
-        guard let service = findHIDPPService() else { return false }
+        guard let service = findHIDPPService() else {
+            logOnce(&reportedNoDevice, "no Logitech HID++ node found; \(describeLogitechNodes())")
+            return false
+        }
         defer { IOObjectRelease(service) }
-        guard let candidate = IOHIDDeviceCreate(kCFAllocatorDefault, service) else { return false }
+        guard let candidate = IOHIDDeviceCreate(kCFAllocatorDefault, service) else {
+            logOnce(&reportedNoDevice, "found a HID++ node but could not open a handle to it")
+            return false
+        }
 
         guard IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
             reportAccessFailureOnce()
@@ -176,6 +185,8 @@ final class KeyboardLight {
             return false
         }
         log("keyboard opened — device index \(hex(deviceIndex)), \(path)")
+        reportedNoDevice = false
+        reportedAccessFailure = false
         applyBrightness()
         return true
     }
@@ -223,15 +234,49 @@ final class KeyboardLight {
         if HIDPP_COLLECTIONS.contains(where: { $0.page == primary.page && $0.usage == primary.usage }) {
             return true
         }
+        return usagePairs(service).contains { pair in
+            HIDPP_COLLECTIONS.contains { $0.page == pair.page && $0.usage == pair.usage }
+        }
+    }
+
+    /// Every (usage page, usage) a node publishes, including the collections
+    /// that are not its primary one.
+    private func usagePairs(_ service: io_registry_entry_t) -> [(page: Int, usage: Int)] {
         guard let ref = IORegistryEntryCreateCFProperty(
             service, kIOHIDDeviceUsagePairsKey as CFString, kCFAllocatorDefault, 0),
-            let pairs = ref.takeRetainedValue() as? [[String: Any]]
-        else { return false }
-        return pairs.contains { pair in
-            let page = (pair[kIOHIDDeviceUsagePageKey] as? NSNumber)?.intValue
-            let usage = (pair[kIOHIDDeviceUsageKey] as? NSNumber)?.intValue
-            return HIDPP_COLLECTIONS.contains { $0.page == page && $0.usage == usage }
+            let pairs = ref.takeRetainedValue() as? NSArray
+        else { return [] }
+        return pairs.compactMap { entry in
+            guard let pair = entry as? NSDictionary,
+                  let page = (pair[kIOHIDDeviceUsagePageKey] as? NSNumber)?.intValue,
+                  let usage = (pair[kIOHIDDeviceUsageKey] as? NSNumber)?.intValue
+            else { return nil }
+            return (page: page, usage: usage)
         }
+    }
+
+    /// What the Logitech nodes on this machine actually expose. Only used to
+    /// make a failure to find the keyboard diagnosable from the log.
+    private func describeLogitechNodes() -> String {
+        guard let matching = IOServiceMatching("IOHIDDevice") else { return "no matching dict" }
+        var iterator: io_iterator_t = 0
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS
+        else { return "registry walk failed" }
+        defer { IOObjectRelease(iterator) }
+
+        var described: [String] = []
+        while true {
+            let service = IOIteratorNext(iterator)
+            if service == 0 { break }
+            defer { IOObjectRelease(service) }
+            guard intProperty(service, kIOHIDVendorIDKey) == VENDOR_ID else { continue }
+            let pid = intProperty(service, kIOHIDProductIDKey) ?? 0
+            let pairs = usagePairs(service)
+                .map { String(format: "%04x/%04x", $0.page, $0.usage) }
+                .joined(separator: ",")
+            described.append(String(format: "%04x", pid) + "[" + pairs + "]")
+        }
+        return described.isEmpty ? "no Logitech nodes at all" : "saw " + described.joined(separator: " ")
     }
 
     private func reportAccessFailureOnce() {
@@ -404,6 +449,14 @@ final class KeyboardLight {
 }
 
 private func hex(_ value: UInt8) -> String { String(format: "0x%02x", value) }
+
+/// Log only the first time a condition holds, so a keyboard that stays asleep
+/// does not fill the log with one line every ten seconds.
+private func logOnce(_ reported: inout Bool, _ message: String) {
+    guard !reported else { return }
+    reported = true
+    log(message)
+}
 
 /// One line on stderr, which the LaunchAgent points at /tmp/logitech-remap.log.
 private func log(_ message: String) {
