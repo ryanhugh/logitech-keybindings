@@ -57,11 +57,23 @@ def apply_mapping(product_id: int) -> bool:
     return rc == 0
 
 
-def mapping_exists_somewhere() -> bool:
-    rc, out, _ = run(HIDUTIL_CMD_BASE + ["--get", "UserKeyMapping"])
+# Decimal forms of the three sources in HIDUTIL_SET_JSON — hidutil prints
+# mappings back as decimal.
+EXPECTED_SRCS = ("30064771298", "30064771299", "30064771302")
+
+
+def mapping_applied(product_id: int) -> bool:
+    """Is our mapping currently live on this specific device?
+
+    Checking per-device matters: another keyboard having a mapping says nothing
+    about ours, and macOS drops the mapping whenever the device re-enumerates
+    (sleep, Bluetooth reconnect).
+    """
+    matching = f'{{"VendorID":{VENDOR_ID},"ProductID":{product_id}}}'
+    rc, out, _ = run(HIDUTIL_CMD_BASE + ["--matching", matching, "--get", "UserKeyMapping"])
     if rc != 0:
         return False
-    return "HIDKeyboardModifierMappingSrc" in out
+    return all(src in out for src in EXPECTED_SRCS)
 
 
 class RemapApp(rumps.App):
@@ -69,7 +81,6 @@ class RemapApp(rumps.App):
         super().__init__("⌨️", quit_button="Quit")
         self.status_item = rumps.MenuItem("Status: starting...")
         self.menu = [self.status_item]
-        self._prev_pids: set[int] = set()
         self._mapped_pids: set[int] = set()
         self._policy_set = False
 
@@ -98,21 +109,20 @@ class RemapApp(rumps.App):
             return
 
         present = present_devices(out)
-        present_pids = {pid for pid, _ in present}
-        global_mapping = mapping_exists_somewhere()
 
         for pid, _ in present:
-            newly_connected = pid not in self._prev_pids
-            needs_apply = newly_connected or not global_mapping or pid not in self._mapped_pids
-            if needs_apply:
-                if apply_mapping(pid):
-                    self._mapped_pids.add(pid)
-                else:
-                    self._mapped_pids.discard(pid)
+            if mapping_applied(pid):
+                self._mapped_pids.add(pid)
+                continue
+            # Missing or partial — (re)apply, then confirm it actually stuck
+            # instead of trusting hidutil's exit status.
+            if apply_mapping(pid) and mapping_applied(pid):
+                self._mapped_pids.add(pid)
+            else:
+                self._mapped_pids.discard(pid)
 
         # Drop bookkeeping for devices that went away.
-        self._mapped_pids &= present_pids
-        self._prev_pids = present_pids
+        self._mapped_pids &= {pid for pid, _ in present}
 
         self.update_status(present, self._mapped_pids)
 

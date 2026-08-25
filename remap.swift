@@ -45,27 +45,40 @@ func run(_ launchPath: String, _ args: [String]) -> (status: Int32, out: String,
             String(data: errData, encoding: .utf8) ?? "")
 }
 
-func intProperty(_ device: IOHIDDevice, _ key: String) -> Int? {
-    guard let ref = IOHIDDeviceGetProperty(device, key as CFString) else { return nil }
-    return (ref as? NSNumber)?.intValue
+func intProperty(_ service: io_registry_entry_t, _ key: String) -> Int? {
+    guard let ref = IORegistryEntryCreateCFProperty(service, key as CFString, kCFAllocatorDefault, 0)
+    else { return nil }
+    return (ref.takeRetainedValue() as? NSNumber)?.intValue
 }
 
 // Return the supported keyboards currently present as HID keyboard devices
 // (PrimaryUsagePage == 1 GenericDesktop, PrimaryUsage == 6 Keyboard).
-func presentDevices(_ manager: IOHIDManager) -> [(pid: Int, name: String)] {
-    guard let devices = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else { return [] }
-    var found: [(Int, String)] = []
-    for (pid, name) in SUPPORTED_DEVICES {
-        for device in devices {
-            guard intProperty(device, kIOHIDVendorIDKey) == VENDOR_ID,
-                  intProperty(device, kIOHIDProductIDKey) == pid,
-                  intProperty(device, kIOHIDPrimaryUsagePageKey) == 1,
-                  intProperty(device, kIOHIDPrimaryUsageKey) == 6 else { continue }
-            found.append((pid, name))
-            break
-        }
+//
+// This walks the IO registry fresh on every call rather than going through an
+// IOHIDManager. IOHIDManagerCopyDevices only reports the device set the manager
+// enumerated when it was opened; a keyboard that connects later never shows up,
+// so a long-lived process launched at login stays blind to it forever.
+func presentDevices() -> [(pid: Int, name: String)] {
+    guard let matching = IOServiceMatching("IOHIDDevice") else { return [] }
+    var iterator: io_iterator_t = 0
+    guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iterator) == KERN_SUCCESS else {
+        return []
     }
-    return found
+    defer { IOObjectRelease(iterator) }
+
+    var presentPIDs = Set<Int>()
+    while true {
+        let service = IOIteratorNext(iterator)
+        if service == 0 { break }
+        defer { IOObjectRelease(service) }
+        guard intProperty(service, kIOHIDVendorIDKey) == VENDOR_ID,
+              intProperty(service, kIOHIDPrimaryUsagePageKey) == 1,
+              intProperty(service, kIOHIDPrimaryUsageKey) == 6,
+              let pid = intProperty(service, kIOHIDProductIDKey) else { continue }
+        presentPIDs.insert(pid)
+    }
+
+    return SUPPORTED_DEVICES.filter { presentPIDs.contains($0.pid) }
 }
 
 func applyMapping(_ productID: Int) -> Bool {
@@ -74,24 +87,39 @@ func applyMapping(_ productID: Int) -> Bool {
     return result.status == 0
 }
 
-func mappingExistsSomewhere() -> Bool {
-    let result = run("/usr/bin/hidutil", ["property", "--get", "UserKeyMapping"])
+// Decimal forms of the three sources in HIDUTIL_SET_JSON — hidutil prints
+// mappings back as decimal.
+let EXPECTED_SRCS = ["30064771298", "30064771299", "30064771302"]
+
+// Is our mapping currently live on this specific device? Checking per-device
+// matters: another keyboard having a mapping says nothing about ours, and macOS
+// drops the mapping whenever the device re-enumerates (sleep, BT reconnect).
+func mappingApplied(_ productID: Int) -> Bool {
+    let matching = "{\"VendorID\":\(VENDOR_ID),\"ProductID\":\(productID)}"
+    let result = run("/usr/bin/hidutil", ["property", "--matching", matching, "--get", "UserKeyMapping"])
     if result.status != 0 { return false }
-    return result.out.contains("HIDKeyboardModifierMappingSrc")
+    return EXPECTED_SRCS.allSatisfy { result.out.contains($0) }
 }
 
 class RemapApp: NSObject, NSApplicationDelegate {
     let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let detailItem = NSMenuItem(title: "Status: starting…", action: nil, keyEquivalent: "")
-    let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
 
-    var prevPIDs = Set<Int>()
     var mappedPIDs = Set<Int>()
     var timer: Timer?
+    var activity: NSObjectProtocol?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         // Menu-bar only: hidden from the Dock and the Cmd-Tab switcher.
         NSApp.setActivationPolicy(.accessory)
+
+        // Opt out of App Nap. A windowless accessory app gets napped, which
+        // coalesces the poll timer to multi-second (or worse) intervals — the
+        // remap then takes an unpredictable while to come back after the
+        // keyboard reconnects. Idle system sleep is still allowed.
+        activity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiatedAllowingIdleSystemSleep],
+            reason: "poll for supported keyboards and keep the remap applied")
 
         statusItem.button?.title = "⌨️"
         let menu = NSMenu()
@@ -101,10 +129,6 @@ class RemapApp: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
 
-        // Match all HID devices; presentDevices() filters to supported keyboards.
-        IOHIDManagerSetDeviceMatching(manager, nil)
-        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-
         timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             self?.poll()
         }
@@ -112,25 +136,24 @@ class RemapApp: NSObject, NSApplicationDelegate {
     }
 
     func poll() {
-        let present = presentDevices(manager)
-        let presentPIDs = Set(present.map { $0.pid })
-        let globalMapping = mappingExistsSomewhere()
+        let present = presentDevices()
 
         for (pid, _) in present {
-            let newlyConnected = !prevPIDs.contains(pid)
-            let needsApply = newlyConnected || !globalMapping || !mappedPIDs.contains(pid)
-            if needsApply {
-                if applyMapping(pid) {
-                    mappedPIDs.insert(pid)
-                } else {
-                    mappedPIDs.remove(pid)
-                }
+            if mappingApplied(pid) {
+                mappedPIDs.insert(pid)
+                continue
+            }
+            // Missing or partial — (re)apply, then confirm it actually stuck
+            // instead of trusting hidutil's exit status.
+            if applyMapping(pid), mappingApplied(pid) {
+                mappedPIDs.insert(pid)
+            } else {
+                mappedPIDs.remove(pid)
             }
         }
 
         // Drop bookkeeping for devices that went away.
-        mappedPIDs.formIntersection(presentPIDs)
-        prevPIDs = presentPIDs
+        mappedPIDs.formIntersection(Set(present.map { $0.pid }))
 
         updateStatus(present)
     }
