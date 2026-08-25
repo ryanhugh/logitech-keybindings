@@ -133,6 +133,11 @@ class RemapApp: NSObject, NSApplicationDelegate {
             self?.poll()
         }
         poll()
+
+        // Hold the keyboard at a static colour. Runs on its own thread and
+        // needs no polling from here — see lighting.swift for why the colour
+        // has to be re-asserted at all.
+        KeyboardLight.shared.start()
     }
 
     func poll() {
@@ -174,7 +179,17 @@ class RemapApp: NSObject, NSApplicationDelegate {
     }
 }
 
-let app = NSApplication.shared
-let delegate = RemapApp()
-app.delegate = delegate
-app.run()
+// An explicit entry point rather than top-level code: Swift only allows the
+// latter in a file called `main.swift`, and the build is two files now
+// (`lighting.swift` is the other). The delegate is held by a static because
+// `NSApplication.delegate` is a weak reference.
+@main
+enum Main {
+    static let delegate = RemapApp()
+
+    static func main() {
+        let app = NSApplication.shared
+        app.delegate = delegate
+        app.run()
+    }
+}

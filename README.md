@@ -44,6 +44,43 @@ Two things this has to get right, both of which were bugs at one point:
 The app also opts out of App Nap — a windowless accessory app otherwise gets its poll timer
 coalesced into multi-second intervals.
 
+## Keyboard lighting
+
+The app also holds the keyboard at a static full-blue backlight. There is nothing to
+configure — it starts with the app and repaints every 10 seconds.
+
+The repaint is not busywork. The keyboard's firmware owns its LEDs: a colour written over
+HID++ lands in the keyboard's RAM, and about twenty seconds later the firmware resumes the
+effect stored on the device (the wave). Logitech's own software avoids this by claiming
+software control of the LEDs, which is a lease that has to be released cleanly on quit,
+crash and sleep, or the keyboard is left with LEDs nobody drives. Repainting inside the
+window is the simpler trade. The write is volatile — keyboard RAM, never its flash — so
+repeating it forever costs the hardware nothing.
+
+`lighting.swift` speaks the same protocol `lights.py` established: HID++ 2.0 over the
+vendor collection, root feature `0x0000` to resolve a feature index, then `0x8070`
+(whole-zone fixed colour, four writes) or, if the keyboard lacks it, `0x8081` (per-key
+sweep). The vendor collection differs by transport — `0xFF43/0x0202` on Bluetooth LE,
+`0xFF00/0x0002` on USB and receivers — and all three are matched.
+
+### Input Monitoring
+
+Setting a colour means *opening* the HID device, which macOS gates behind Input Monitoring.
+The remapping half never needed it (`hidutil` sets key mappings without opening anything),
+so this is a new grant:
+
+System Settings > Privacy & Security > Input Monitoring > `+` > Cmd-Shift-G >
+`~/Desktop/code/logitech-keyboard/logitech-remap`
+
+Without it the remapper still works and the log says so once:
+
+```
+lighting: Input Monitoring is not granted to logitech-remap; the colour cannot be set
+```
+
+The binary is unsigned, so a rebuild can invalidate the grant and make macOS re-prompt. If
+the lighting silently stops after `./build.sh`, check that entry first.
+
 ## Status
 
 - Menu bar icon shows connection/remap state (`⌨️` mapped, `⌨️ ⚠️` remap failed, `⌨️ ✕` no keyboard)
@@ -88,6 +125,7 @@ Python needs Full Disk Access in System Settings > Privacy & Security because th
 ## Files
 
 - `remap.swift` — the app that ships (menu bar + keyboard polling + hidutil remapping)
+- `lighting.swift` — holds the keyboard at a static colour over HID++
 - `logitech-remap` — build output, the binary the LaunchAgent runs
 - `build.sh` — build + restart
 - `remap.py` — original Python implementation
@@ -103,6 +141,6 @@ launchctl list | grep logitech-remap
 # What mapping is live on the keyboard right now?
 hidutil property --matching '{"VendorID":1133,"ProductID":45963}' --get UserKeyMapping
 
-# Logs
+# Logs (lighting reports its feature path and any failures here)
 cat /tmp/logitech-remap.log
 ```
