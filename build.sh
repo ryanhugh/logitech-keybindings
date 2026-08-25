@@ -5,7 +5,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-swiftc -O remap.swift -o logitech-remap
+swiftc -O remap.swift lighting.swift -o logitech-remap
 echo "built ./logitech-remap"
 
 if launchctl list | grep -q com.ryanhughes.logitech-remap; then
